@@ -1,9 +1,11 @@
 import unittest
-
+from functools import reduce
+from shapely import to_geojson
 from polygon_geohasher.polygon_geohasher import (
     polygon_to_geohashes,
     geohash_to_polygon,
     geohashes_to_polygon,
+    polygon_to_geohashes_with_intersection,
 )
 from shapely import geometry
 
@@ -37,6 +39,16 @@ class TestSimpleMethods(unittest.TestCase):
         polygon = geohashes_to_polygon(polygon_to_geohashes(test_polygon, 7, False))
 
         self.assertTrue(polygon.area >= test_polygon.area)
+        
+        grid_size = 0.000001
+        intersections = polygon_to_geohashes_with_intersection(test_polygon, 7, False, grid_size)
+        multi_polygon = geometry.MultiPolygon(intersections.values())
+        print(to_geojson(test_polygon))
+        print(to_geojson(multi_polygon))
+        # check visually on https://geojson.io/
+        self.assertTrue(test_polygon.area - multi_polygon.area <= grid_size)
+        # print(test_polygon.area)
+        # print(multi_polygon.area)
 
 
 if __name__ == "__main__":
