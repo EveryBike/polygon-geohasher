@@ -1,8 +1,71 @@
 import geohash
-import queue
 
+from collections import deque
 from shapely import geometry
 from shapely.ops import unary_union
+from shapely.prepared import prep
+
+_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def _geohash_bbox(geo):
+    lat_centroid, lng_centroid, lat_offset, lng_offset = geohash.decode_exactly(geo)
+    minx = lng_centroid - lng_offset
+    miny = lat_centroid - lat_offset
+    maxx = lng_centroid + lng_offset
+    maxy = lat_centroid + lat_offset
+    return minx, miny, maxx, maxy
+
+
+def _bounds_intersect(bounds, other_bounds):
+    minx, miny, maxx, maxy = bounds
+    ominx, ominy, omaxx, omaxy = other_bounds
+    if maxx < ominx or omaxx < minx:
+        return False
+    if maxy < ominy or omaxy < miny:
+        return False
+    return True
+
+
+def _cover_bounds(bounds, precision):
+    minx, miny, maxx, maxy = bounds
+    center_lat = (miny + maxy) / 2.0
+    center_lon = (minx + maxx) / 2.0
+    start = geohash.encode(center_lat, center_lon, precision)
+
+    queue = deque([start])
+    visited = set()
+    results = []
+    neighbors = geohash.neighbors
+
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        current_bounds = _geohash_bbox(current)
+        if not _bounds_intersect(current_bounds, bounds):
+            continue
+
+        results.append(current)
+        for neighbor in neighbors(current):
+            if neighbor not in visited:
+                queue.append(neighbor)
+
+    return results
+
+
+def _expand_children(prefix, target_precision, out_set):
+    stack = [prefix]
+    base32 = _BASE32
+    while stack:
+        current = stack.pop()
+        if len(current) == target_precision:
+            out_set.add(current)
+            continue
+        for char in base32:
+            stack.append(current + char)
 
 
 def geohash_to_polygon(geo):
@@ -27,104 +90,125 @@ def polygon_to_geohashes(polygon, precision, inner=True):
     :param inner: bool, default 'True'. If false, geohashes that are completely outside from the polygon are ignored.
     :return: set. Set of geohashes that form the polygon.
     """
-    inner_geohashes = set()
-    outer_geohashes = set()
+    if polygon.is_empty:
+        return set()
 
-    envelope = polygon.envelope
-    centroid = polygon.centroid
+    prepared_polygon = prep(polygon)
+    bounds = polygon.bounds
+    seed_precision = min(precision, 3)
+    seeds = _cover_bounds(bounds, seed_precision)
 
-    testing_geohashes = queue.Queue()
-    testing_geohashes.put(geohash.encode(centroid.y, centroid.x, precision))
+    results = set()
+    stack = list(seeds)
+    contains = prepared_polygon.contains
+    intersects = prepared_polygon.intersects
 
-    while not testing_geohashes.empty():
-        current_geohash = testing_geohashes.get()
+    while stack:
+        current = stack.pop()
+        current_bounds = _geohash_bbox(current)
+        if not _bounds_intersect(current_bounds, bounds):
+            continue
 
-        if (
-            current_geohash not in inner_geohashes
-            and current_geohash not in outer_geohashes
-        ):
-            current_polygon = geohash_to_polygon(current_geohash)
+        current_polygon = geometry.box(*current_bounds)
+        if not intersects(current_polygon):
+            continue
 
-            condition = (
-                envelope.contains(current_polygon)
-                if inner
-                else envelope.intersects(current_polygon)
-            )
-
-            if condition:
-                if inner:
-                    if polygon.contains(current_polygon):
-                        inner_geohashes.add(current_geohash)
-                    else:
-                        outer_geohashes.add(current_geohash)
+        if inner:
+            if contains(current_polygon):
+                if len(current) == precision:
+                    results.add(current)
                 else:
-                    if polygon.intersects(current_polygon):
-                        inner_geohashes.add(current_geohash)
-                    else:
-                        outer_geohashes.add(current_geohash)
-                for neighbor in geohash.neighbors(current_geohash):
-                    if (
-                        neighbor not in inner_geohashes
-                        and neighbor not in outer_geohashes
-                    ):
-                        testing_geohashes.put(neighbor)
+                    _expand_children(current, precision, results)
+            elif len(current) < precision:
+                for char in _BASE32:
+                    stack.append(current + char)
+            continue
 
-    return inner_geohashes
+        if len(current) == precision:
+            results.add(current)
+            continue
+
+        if contains(current_polygon):
+            _expand_children(current, precision, results)
+        else:
+            for char in _BASE32:
+                stack.append(current + char)
+
+    return results
+
 
 def polygon_to_geohashes_with_intersection(polygon, precision, inner=True, grid_size=None):
     """
     :param polygon: shapely polygon.
     :param precision: int. Geohashes' precision that form resulting polygon.
     :param inner: bool, default 'True'. If false, geohashes that are completely outside from the polygon are ignored.
-    :param grid_size: double, default 0. Precision grid size, 
-    if none-zero, nput coordinates will be snapped to a precision grid of that size and resulting coordinates will be snapped to that same grid
-    If 0, this operation will use double precision coordinates. 
+    :param grid_size: double, default None. Precision grid size,
+    if non-zero, input coordinates will be snapped to a precision grid of that size and resulting coordinates will be snapped to that same grid.
+    If 0, this operation will use double precision coordinates.
     If None, the highest precision of the inputs will be used.
-    :return: dict. key is the geohash value is the intersected polygon.
+    :return: dict. key is the geohash, value is the intersected polygon.
     """
-    inner_geohashes = {}
-    outer_geohashes = set()
-    
-    envelope = polygon.envelope
-    centroid = polygon.centroid
+    if polygon.is_empty:
+        return {}
 
-    testing_geohashes = queue.Queue()
-    testing_geohashes.put(geohash.encode(centroid.y, centroid.x, precision))
+    prepared_polygon = prep(polygon)
+    bounds = polygon.bounds
+    seed_precision = min(precision, 3)
+    seeds = _cover_bounds(bounds, seed_precision)
 
-    while not testing_geohashes.empty():
-        current_geohash = testing_geohashes.get()
+    intersection_kwargs = {}
+    if grid_size is not None:
+        intersection_kwargs["grid_size"] = grid_size
 
-        if (
-            current_geohash not in inner_geohashes
-            and current_geohash not in outer_geohashes
-        ):
-            current_polygon = geohash_to_polygon(current_geohash)
+    results = {}
+    stack = list(seeds)
+    contains = prepared_polygon.contains
+    intersects = prepared_polygon.intersects
 
-            condition = (
-                envelope.contains(current_polygon)
-                if inner
-                else envelope.intersects(current_polygon)
-            )
+    while stack:
+        current = stack.pop()
+        current_bounds = _geohash_bbox(current)
+        if not _bounds_intersect(current_bounds, bounds):
+            continue
 
-            if condition:
-                if inner:
-                    if polygon.contains(current_polygon):
-                        inner_geohashes[current_geohash] = current_polygon
-                    else:
-                        outer_geohashes.add(current_geohash)
+        current_polygon = geometry.box(*current_bounds)
+        if not intersects(current_polygon):
+            continue
+
+        if inner:
+            if contains(current_polygon):
+                if len(current) == precision:
+                    results[current] = current_polygon
                 else:
-                    if polygon.intersects(current_polygon):
-                        inner_geohashes[current_geohash] = polygon.intersection(current_polygon, grid_size=grid_size)
-                    else:
-                        outer_geohashes.add(current_geohash)
-                for neighbor in geohash.neighbors(current_geohash):
-                    if (
-                        neighbor not in inner_geohashes
-                        and neighbor not in outer_geohashes
-                    ):
-                        testing_geohashes.put(neighbor)
+                    children = set()
+                    _expand_children(current, precision, children)
+                    for child in children:
+                        results[child] = geometry.box(*_geohash_bbox(child))
+            elif len(current) < precision:
+                for char in _BASE32:
+                    stack.append(current + char)
+            continue
 
-    return inner_geohashes
+        # outer mode (inner=False)
+        if contains(current_polygon):
+            if len(current) == precision:
+                results[current] = current_polygon
+            else:
+                children = set()
+                _expand_children(current, precision, children)
+                for child in children:
+                    results[child] = geometry.box(*_geohash_bbox(child))
+            continue
+
+        if len(current) == precision:
+            results[current] = polygon.intersection(current_polygon, **intersection_kwargs)
+            continue
+
+        for char in _BASE32:
+            stack.append(current + char)
+
+    return results
+
 
 def geohashes_to_polygon(geohashes):
     """
